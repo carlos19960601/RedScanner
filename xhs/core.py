@@ -1,6 +1,8 @@
+import asyncio
 import json
+import time
 from email.mime import base
-from typing import Optional
+from typing import Dict, Optional
 from unittest import async_case
 
 from playwright.async_api import BrowserContext, BrowserType, Page, async_playwright
@@ -8,6 +10,7 @@ from playwright.async_api import BrowserContext, BrowserType, Page, async_playwr
 from config import base_config
 from tools import utils
 from xhs.client import XiaoHongShuClient
+from xhs.exception import DataFetchError
 from xhs.helper import get_search_id
 from xhs.login import XiaoHongShuLogin
 
@@ -48,13 +51,82 @@ class XiaoHongShuCrawler:
             print("Xhs Crawler finished ...")
 
     async def search(self) -> None:
-
         search_id = get_search_id()  # 相同关键词，获取更分页的时候不用更改
         notes_res = await self.xhs_client.get_note_by_keyword(
             keyword=base_config.KEYWORD,
             search_id=search_id,
         )
         print(json.dumps(notes_res, indent=2, ensure_ascii=False))
+
+        semaphore = asyncio.Semaphore(base_config.MAX_CONCURRENCY_NUM)
+        task_list = [
+            self.get_note_detail_async_task(
+                post_item.get("id"),
+                xsec_source=post_item.get("xsec_source"),
+                xsec_token=post_item.get("xsec_token"),
+                semaphore=semaphore,
+            )
+            for post_item in notes_res.get("items", {})
+            if post_item.get("model_type") not in ("rec_query", "hot_query")
+        ]
+        note_details = await asyncio.gather(*task_list)
+        print(json.dumps(note_details, indent=2, ensure_ascii=False))
+
+    async def get_note_detail_async_task(
+        self,
+        note_id: str,
+        xsec_source: str,
+        xsec_token: str,
+        semaphore: asyncio.Semaphore,
+    ) -> Optional[Dict]:
+        note_detail_from_html, note_detail_from_api = None, None
+        async with semaphore:
+            try:
+                # 尝试直接获取网页版笔记详情，携带cookie
+                note_detail_from_html: Optional[Dict] = (
+                    await self.xhs_client.get_note_by_id_from_html(
+                        note_id,
+                        xsec_source,
+                        xsec_token,
+                        enable_cookie=True,
+                    )
+                )
+                time.sleep(1)
+                if not note_detail_from_html:
+                    # 如果网页版笔记详情获取失败，则尝试API获取
+                    note_detail_from_api = await self.xhs_client.get_note_by_id(
+                        note_id, xsec_source, xsec_token
+                    )
+
+                note_detail = note_detail_from_html or note_detail_from_api
+                if note_detail:
+                    return note_detail
+
+            except DataFetchError as e:
+                print(f"Get note detail error: {e}")
+                return None
+
+    async def get_note_by_id(
+        self, note_id: str, xsec_source: str, xsec_token: str
+    ) -> Dict:
+        if xsec_source == "":
+            xsec_source = "pc_search"
+
+        data = {
+            "source_note_id": note_id,
+            "image_formats": ["jpg", "webp", "avif"],
+            "extra": {"need_body_topic": 1},
+            "xsec_source": xsec_source,
+            "xsec_token": xsec_token,
+        }
+        uri = "/api/sns/web/v1/feed"
+        res = await self.post(uri, data)
+        if res and res.get("items"):
+            res_dict: Dict = res["items"][0]["note_card"]
+            return res_dict
+        # 爬取频繁了可能会出现有的笔记能有结果有的没有
+        utils.logger.error(f"get note id:{note_id} empty and res:{res}")
+        return dict()
 
     async def create_xhs_client(self) -> XiaoHongShuClient:
         cookie_str, cookie_dict = utils.convert_cookies(

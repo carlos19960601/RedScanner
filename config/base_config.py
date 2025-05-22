@@ -5,3 +5,7 @@ LOGIN_TYPE = "cookie"  # qrcode or phone or cookie
 
 
 KEYWORD = "吹风机"
+
+
+# 并发爬虫数量控制
+MAX_CONCURRENCY_NUM = 1
